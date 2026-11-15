@@ -66,6 +66,7 @@
     againBtn: $('againBtn'),
     resultInfo: $('resultInfo'),
     formatBadge: $('formatBadge'),
+    footnote: $('footnote'),
     canvas: $('exportCanvas')
   };
 
@@ -547,17 +548,41 @@
   }
 
   function initFormatBadge() {
+    if (offlineAvailable() && els.formatSelect.value === 'mp4') {
+      els.formatBadge.textContent = 'MP4 · 离线编码';
+      updateFootnote();
+      return;
+    }
     var canExport = window.MediaRecorder &&
       window.HTMLCanvasElement &&
       HTMLCanvasElement.prototype.captureStream;
     if (!canExport) {
       els.formatBadge.textContent = '当前浏览器不支持导出';
-      return;
+    } else {
+      var m = pickMime(els.formatSelect.value);
+      if (!m) els.formatBadge.textContent = '当前浏览器不支持导出';
+      else if (m.indexOf('mp4') >= 0) els.formatBadge.textContent = '导出 MP4';
+      else els.formatBadge.textContent = '导出 WebM';
     }
-    var m = pickMime(els.formatSelect.value);
-    if (!m) els.formatBadge.textContent = '当前浏览器不支持导出';
-    else if (m.indexOf('mp4') >= 0) els.formatBadge.textContent = '导出 MP4';
-    else els.formatBadge.textContent = '导出 WebM';
+    updateFootnote();
+  }
+
+  function offlineAvailable() {
+    return !!(window.OfflineExport && window.OfflineExport.supported());
+  }
+
+  function updateFootnote() {
+    if (!els.footnote) return;
+    if (offlineAvailable() && els.formatSelect.value === 'mp4') {
+      els.footnote.innerHTML = '导出走<strong>离线编码</strong>：耗时与成片时长无关，通常几秒完成，时长精确到帧。' +
+        '音频会随速度快放（音调升高）；若离线编码不可用会自动回退实时录制。';
+    } else if (offlineAvailable()) {
+      els.footnote.innerHTML = 'WebM 仍走<strong>实时录制</strong>，耗时约等于输出时长。' +
+        '想要更快，把格式换回 MP4（离线编码）。';
+    } else {
+      els.footnote.innerHTML = '导出是实时录制：耗时约等于<strong>输出时长</strong>，期间请保持本页在前台。' +
+        '若成片明显长于目标，说明本机变速/编码跟不上，可关闭「音调不变」、改用 WebM 或降低分辨率。';
+    }
   }
 
   function setStatus(text) {
@@ -585,6 +610,54 @@
     els.exportBtn.disabled = !state.hasFile;
     els.video.playbackRate = clamp(els.previewSpeed.checked ? currentSpeed() : 1, 0.0625, MAX_SPEED);
     render();
+  }
+
+  function showResult(blob, name, text) {
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+    resultUrl = URL.createObjectURL(blob);
+    els.resultVideo.src = resultUrl;
+    els.downloadLink.href = resultUrl;
+    els.downloadLink.download = name;
+    els.resultInfo.textContent = text;
+    els.resultCard.hidden = false;
+    els.progressBar.style.width = '100%';
+    els.exportPct.textContent = '100%';
+    if (els.resultCard.scrollIntoView) {
+      els.resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  // 离线编码：耗时与成片时长无关，导出后由调用方展示结果
+  async function runOfflineExport(speed, start, end) {
+    var dims = computeDims();
+    exportT0 = performance.now();
+    var res = await window.OfflineExport.run({
+      file: state.file,
+      start: start,
+      end: end,
+      speed: speed,
+      width: dims.w,
+      height: dims.h,
+      withAudio: els.includeAudio.checked,
+      onProgress: function (text, p) {
+        var pct = clamp(p, 0, 0.99);
+        els.progressBar.style.width = (pct * 100).toFixed(1) + '%';
+        els.exportPct.textContent = Math.round(pct * 100) + '%';
+        setStatus(text);
+      },
+      isCancelled: function () { return state.cancelRequested; }
+    });
+
+    var elapsed = (performance.now() - exportT0) / 1000;
+    var base = (state.file && state.file.name ? state.file.name : 'video').replace(/\.[^.]+$/, '');
+    var name = base + '_' + (Math.round(speed * 100) / 100) + 'x_' + Math.round(res.duration) + 's.mp4';
+    var info = 'MP4 · ' + (res.blob.size / 1048576).toFixed(1) + ' MB · 时长 ' +
+      fmtTenth(res.duration) + '（目标 ' + fmtTenth((end - start) / speed) + '）· 编码用时 ' +
+      elapsed.toFixed(1) + ' 秒';
+    if (res.hasAudio) info += ' · 音频随速快放';
+    else if (els.includeAudio.checked) info += ' · 未包含音频';
+    showResult(res.blob, name, info);
+    setStatus('导出完成');
   }
 
   function startExport() {
@@ -618,6 +691,24 @@
 
     var run = async function () {
       try {
+        // 优先离线编码：耗时与成片时长无关
+        if (offlineAvailable() && els.formatSelect.value === 'mp4') {
+          try {
+            await runOfflineExport(speed, start, end);
+            return;
+          } catch (err) {
+            if (err && err.name === 'OfflineCancelled') {
+              setStatus('已取消导出');
+              els.exportBox.hidden = true;
+              return;
+            }
+            console.warn('离线编码不可用，回退实时录制：', err);
+            setStatus('离线编码不可用，改用实时录制…');
+            els.progressBar.style.width = '0%';
+            els.exportPct.textContent = '0%';
+          }
+        }
+
         await ensureAudioGraph();
         applyPitch();
 
@@ -712,26 +803,13 @@
         var base = (state.file && state.file.name ? state.file.name : 'video').replace(/\.[^.]+$/, '');
         var name = base + '_' + (Math.round(speed * 100) / 100) + 'x_' + Math.round(realDur) + 's.' + ext;
 
-        if (resultUrl) URL.revokeObjectURL(resultUrl);
-        resultUrl = URL.createObjectURL(blob);
-
-        els.resultVideo.src = resultUrl;
-        els.downloadLink.href = resultUrl;
-        els.downloadLink.download = name;
         var targetDur = len / speed;
         var text = ext.toUpperCase() + ' · ' + (blob.size / 1048576).toFixed(1) +
           ' MB · 实际输出 ' + fmtTenth(realDur) + '（目标 ' + fmtTenth(targetDur) + '）';
         if (realDur - targetDur > Math.max(0.6, targetDur * 0.08)) {
           text += ' · 本机编码跟不上，建议改用 WebM 或降低分辨率';
         }
-        els.resultInfo.textContent = text;
-        els.resultCard.hidden = false;
-        if (els.resultCard.scrollIntoView) {
-          els.resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        }
-
-        els.progressBar.style.width = '100%';
-        els.exportPct.textContent = '100%';
+        showResult(blob, name, text);
         setStatus('导出完成');
       } catch (err) {
         console.error(err);

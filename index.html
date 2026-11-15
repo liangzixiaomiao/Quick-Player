@@ -151,8 +151,8 @@
             </label>
             <label class="select-field">格式
               <select id="formatSelect">
-                <option value="mp4">MP4（兼容性好）</option>
-                <option value="webm">WebM（导出更快）</option>
+                <option value="mp4">MP4（离线编码·快）</option>
+                <option value="webm">WebM（实时录制·慢）</option>
               </select>
             </label>
           </div>
@@ -187,6 +187,9 @@
 
   <canvas id="exportCanvas" class="hidden-video"></canvas>
 
+  <script src="vendor/mp4box.all.min.js"></script>
+  <script src="vendor/mp4-muxer.js"></script>
+  <script src="offline-export.js"></script>
   <script src="app.js"></script>
 </body>
 
