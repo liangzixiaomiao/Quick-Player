@@ -62,57 +62,89 @@
     });
   }
 
-  // 从 mp4box 的 avcC 重建 AVCDecoderConfigurationRecord，供 VideoDecoder 使用
+  // 从 mp4box 的 avcC（或码流里的 SPS/PPS）重建 AVCDecoderConfigurationRecord
+  function naluOf(item) { return (item && item.nalu) ? item.nalu : item; }
+
+  function buildAvcRecord(profile, compat, level, ls, sps, pps) {
+    var size = 7, k;
+    for (k = 0; k < sps.length; k++) size += 2 + sps[k].length;
+    for (k = 0; k < pps.length; k++) size += 2 + pps[k].length;
+
+    var out = new Uint8Array(size);
+    var p = 0;
+    out[p++] = 1;
+    out[p++] = profile;
+    out[p++] = compat;
+    out[p++] = level;
+    out[p++] = 0xFC | ((ls == null ? 3 : ls) & 3);
+    out[p++] = 0xE0 | (sps.length & 0x1F);
+    for (k = 0; k < sps.length; k++) {
+      out[p++] = (sps[k].length >> 8) & 0xFF;
+      out[p++] = sps[k].length & 0xFF;
+      out.set(sps[k], p);
+      p += sps[k].length;
+    }
+    out[p++] = pps.length & 0xFF;
+    for (k = 0; k < pps.length; k++) {
+      out[p++] = (pps[k].length >> 8) & 0xFF;
+      out[p++] = pps[k].length & 0xFF;
+      out.set(pps[k], p);
+      p += pps[k].length;
+    }
+
+    return {
+      codec: 'avc1.' + hex2(profile) + hex2(compat) + hex2(level),
+      description: out
+    };
+  }
+
   function readAvc(mp4, trackId) {
     var trak = null;
     try { trak = mp4.getTrackById(trackId); } catch (e) {}
     if (!trak || !trak.mdia || !trak.mdia.minf) return null;
 
     var entries = trak.mdia.minf.stbl.stsd.entries;
-    var avcC = null;
     for (var i = 0; i < entries.length; i++) {
-      if (entries[i].avcC) { avcC = entries[i].avcC; break; }
+      var avcC = entries[i].avcC;
+      if (!avcC) continue;
+      var sps = (avcC.SPS || []).map(naluOf);
+      var pps = (avcC.PPS || []).map(naluOf);
+      if (!sps.length || !pps.length) continue;
+      return buildAvcRecord(
+        avcC.AVCProfileIndication, avcC.profile_compatibility, avcC.AVCLevelIndication,
+        avcC.lengthSizeMinusOne, sps, pps
+      );
     }
-    if (!avcC) return null;
+    return null;
+  }
 
-    var sps = avcC.SPS || [], pps = avcC.PPS || [];
-    if (!sps.length || !pps.length) return null;
-    // 不同版本的 mp4box 存放方式不同：有的是 {length, nalu}，有的是裸 Uint8Array
-    function naluOf(item) { return (item && item.nalu) ? item.nalu : item; }
-
-    var size = 7, k;
-    for (k = 0; k < sps.length; k++) size += 2 + naluOf(sps[k]).length;
-    for (k = 0; k < pps.length; k++) size += 2 + naluOf(pps[k]).length;
-
-    var out = new Uint8Array(size);
-    var p = 0;
-    out[p++] = 1;
-    out[p++] = avcC.AVCProfileIndication;
-    out[p++] = avcC.profile_compatibility;
-    out[p++] = avcC.AVCLevelIndication;
-    out[p++] = 0xFC | ((avcC.lengthSizeMinusOne == null ? 3 : avcC.lengthSizeMinusOne) & 3);
-    out[p++] = 0xE0 | (sps.length & 0x1F);
-    for (k = 0; k < sps.length; k++) {
-      var s1 = naluOf(sps[k]);
-      out[p++] = (s1.length >> 8) & 0xFF;
-      out[p++] = s1.length & 0xFF;
-      out.set(s1, p);
-      p += s1.length;
+  // 兜底：从第一个关键帧的码流里找 SPS/PPS（avc3 等参数集不全在 stsd 里的情况）
+  function avcFromBitstream(sample) {
+    var data = sample && sample.data;
+    if (!data || data.length < 16) return null;
+    var sizes = [4, 2];
+    for (var si = 0; si < sizes.length; si++) {
+      var header = sizes[si], p = 0, sps = null, pps = null;
+      while (p + header <= data.length) {
+        var len;
+        if (header === 4) {
+          len = ((data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3]) >>> 0;
+        } else {
+          len = (data[p] << 8) | data[p + 1];
+        }
+        p += header;
+        if (!len || p + len > data.length) break;
+        var t = data[p] & 0x1F;
+        if (t === 7 && !sps) sps = data.subarray(p, p + len);
+        else if (t === 8 && !pps) pps = data.subarray(p, p + len);
+        p += len;
+        if (sps && pps) break;
+      }
+      if (sps && pps && sps.length > 4) {
+        return buildAvcRecord(sps[1], sps[2], sps[3], header - 1, [sps], [pps]);
+      }
     }
-    out[p++] = pps.length & 0xFF;
-    for (k = 0; k < pps.length; k++) {
-      var s2 = naluOf(pps[k]);
-      out[p++] = (s2.length >> 8) & 0xFF;
-      out[p++] = s2.length & 0xFF;
-      out.set(s2, p);
-      p += s2.length;
-    }
-
-    return {
-      codec: 'avc1.' + hex2(avcC.AVCProfileIndication) + hex2(avcC.profile_compatibility) +
-        hex2(avcC.AVCLevelIndication),
-      description: out
-    };
+    return null;
   }
 
   /* ---------------- 取样 ---------------- */
@@ -130,6 +162,15 @@
   }
 
   /* ---------------- 音频：解码 → 重采样 → AAC 编码 ---------------- */
+  // AAC 的 AudioSpecificConfig（AAC-LC）
+  var AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+  function aacDescription(rate, channels) {
+    var idx = AAC_RATES.indexOf(rate);
+    if (idx < 0) return null;
+    return new Uint8Array([(2 << 3) | (idx >> 1), ((idx & 1) << 7) | (channels << 3)]);
+  }
+
   // 返回 { chunks: [{chunk, meta}], channels }；失败时抛错由调用方降级为无声
   async function encodeAudio(samples, track, opt) {
     if (!window.AudioEncoder || !window.AudioDecoder) throw unsupported('音频离线编码不可用');
@@ -140,15 +181,14 @@
     var channels = Math.max(1, Math.min(2, info.channel_count || 2));
     if (!rate) throw unsupported('未知的音频采样率');
 
-    var RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
-    var freqIdx = RATES.indexOf(rate);
-    if (freqIdx < 0) throw unsupported('不支持的音频采样率：' + rate);
+    var asc = aacDescription(rate, channels);
+    if (!asc) throw unsupported('不支持的音频采样率：' + rate);
 
     var decCfg = {
       codec: 'mp4a.40.2',
       sampleRate: rate,
       numberOfChannels: channels,
-      description: new Uint8Array([(2 << 3) | (freqIdx >> 1), ((freqIdx & 1) << 7) | (channels << 3)])
+      description: asc
     };
     var decSupport = await AudioDecoder.isConfigSupported(decCfg);
     if (!decSupport || !decSupport.supported) throw unsupported('无法解码该音频');
@@ -358,7 +398,8 @@
         timestamp: Math.round(nextOut * 1e6 / FPS),
         duration: Math.round(1e6 / FPS)
       });
-      encoder.encode(vf, { keyFrame: nextOut % (FPS * 2) === 0 });
+      // 每 1 秒一个关键帧，保证各种播放器都能拖动进度条
+      encoder.encode(vf, { keyFrame: nextOut % FPS === 0 });
       vf.close();
       nextOut++;
     }
@@ -447,14 +488,25 @@
 
     var vt = info.videoTracks && info.videoTracks[0];
     if (!vt) throw unsupported('没有找到视频轨道');
-    var avc = readAvc(mp4, vt.id);
-    if (!avc) throw unsupported('视频不是 H.264（AVC）编码');
 
     var at = opts.withAudio && info.audioTracks ? info.audioTracks[0] : null;
     if (at && !/^mp4a/.test(at.codec || '')) at = null;
 
     onProgress('分离音视频轨道…', 0.02);
     var data = collect(mp4, vt.id, at ? at.id : 0);
+
+    var avc = readAvc(mp4, vt.id);
+    if (!avc) {
+      // 参数集不在 stsd 里时，从第一个关键帧码流里找
+      for (var v = 0; v < data.video.length; v++) {
+        if (!data.video[v].is_sync) continue;
+        avc = avcFromBitstream(data.video[v]);
+        break;
+      }
+    }
+    if (!avc) {
+      throw unsupported('视频编码是 ' + (vt.codec || '未知') + '，离线编码只支持 H.264');
+    }
 
     var audio = null;
     if (at) {
@@ -511,8 +563,77 @@
     };
   }
 
+  /* ---------------- 实时录制结果：重建 MP4 索引 ---------------- */
+  // MediaRecorder 产出的是分片 MP4，很多播放器无法拖动进度条；
+  // 解封装后重新封装成带索引的普通 MP4。
+  async function rebuildMp4(blob) {
+    if (!libs().mp4box || !libs().Muxer) return null;
+    var parsed = await demux(await blob.arrayBuffer());
+    var mp4 = parsed.mp4;
+    var info = parsed.info;
+    var vt = info.videoTracks && info.videoTracks[0];
+    if (!vt) return null;
+    var avc = readAvc(mp4, vt.id);
+    if (!avc) return null;
+
+    var at = info.audioTracks && info.audioTracks[0];
+    if (at && !/^mp4a/.test(at.codec || '')) at = null;
+    var data = collect(mp4, vt.id, at ? at.id : 0);
+    if (!data.video.length) return null;
+
+    var w = (vt.video && vt.video.width) || vt.track_width || 0;
+    var h = (vt.video && vt.video.height) || vt.track_height || 0;
+    w = Math.max(2, w - (w % 2));
+    h = Math.max(2, h - (h % 2));
+    if (!w || !h) return null;
+
+    var rate = at ? Math.round((at.audio || {}).sample_rate || 0) : 0;
+    var chans = at ? Math.max(1, Math.min(2, (at.audio || {}).channel_count || 2)) : 0;
+    var asc = rate ? aacDescription(rate, chans) : null;
+    var withAudio = !!(at && asc && data.audio.length);
+
+    var muxer = new (libs().Muxer)({
+      target: new (libs().Target)(),
+      video: { codec: 'avc', width: w, height: h },
+      audio: withAudio ? { codec: 'aac', numberOfChannels: chans, sampleRate: rate } : undefined,
+      fastStart: 'in-memory'
+    });
+
+    var video = data.video.slice().sort(function (a, b) { return a.cts - b.cts; });
+    var vbase = video[0].cts;
+    for (var i = 0; i < video.length; i++) {
+      var s = video[i];
+      muxer.addVideoChunk(new EncodedVideoChunk({
+        type: s.is_sync ? 'key' : 'delta',
+        timestamp: Math.round((s.cts - vbase) / s.timescale * 1e6),
+        duration: Math.round(s.duration / s.timescale * 1e6),
+        data: s.data
+      }), i === 0 ? { decoderConfig: { codec: avc.codec, description: avc.description } } : undefined);
+    }
+
+    if (withAudio) {
+      var audio = data.audio.slice().sort(function (a, b) { return a.cts - b.cts; });
+      var abase = audio[0].cts;
+      for (var j = 0; j < audio.length; j++) {
+        var a2 = audio[j];
+        muxer.addAudioChunk(new EncodedAudioChunk({
+          type: 'key',
+          timestamp: Math.round((a2.cts - abase) / a2.timescale * 1e6),
+          duration: Math.round(a2.duration / a2.timescale * 1e6),
+          data: a2.data
+        }), j === 0 ? {
+          decoderConfig: { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: chans, description: asc }
+        } : undefined);
+      }
+    }
+
+    muxer.finalize();
+    return new Blob([muxer.target.buffer], { type: 'video/mp4' });
+  }
+
   window.OfflineExport = {
     supported: supported,
-    run: run
+    run: run,
+    rebuildMp4: rebuildMp4
   };
 })();

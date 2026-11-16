@@ -96,6 +96,7 @@
   var progressTimer = 0;
   var exportT0 = 0, exportExpected = 0;
   var resultUrl = '';
+  var offlineFallbackReason = '';
   var stripToken = 0;
 
   var audioCtx = null, recordGain = null, monitorGain = null, audioDest = null;
@@ -651,7 +652,7 @@
     var elapsed = (performance.now() - exportT0) / 1000;
     var base = (state.file && state.file.name ? state.file.name : 'video').replace(/\.[^.]+$/, '');
     var name = base + '_' + (Math.round(speed * 100) / 100) + 'x_' + Math.round(res.duration) + 's.mp4';
-    var info = 'MP4 · ' + (res.blob.size / 1048576).toFixed(1) + ' MB · 时长 ' +
+    var info = 'MP4（离线编码）· ' + (res.blob.size / 1048576).toFixed(1) + ' MB · 时长 ' +
       fmtTenth(res.duration) + '（目标 ' + fmtTenth((end - start) / speed) + '）· 编码用时 ' +
       elapsed.toFixed(1) + ' 秒';
     if (res.hasAudio) info += ' · 音频随速快放';
@@ -692,6 +693,7 @@
     var run = async function () {
       try {
         // 优先离线编码：耗时与成片时长无关
+        offlineFallbackReason = '';
         if (offlineAvailable() && els.formatSelect.value === 'mp4') {
           try {
             await runOfflineExport(speed, start, end);
@@ -702,8 +704,9 @@
               els.exportBox.hidden = true;
               return;
             }
+            offlineFallbackReason = (err && err.message) || '未知原因';
             console.warn('离线编码不可用，回退实时录制：', err);
-            setStatus('离线编码不可用，改用实时录制…');
+            setStatus('离线编码不可用（' + offlineFallbackReason + '），改用实时录制…');
             els.progressBar.style.width = '0%';
             els.exportPct.textContent = '0%';
           }
@@ -799,13 +802,29 @@
         if (!blob.size) throw new Error('没有录制到画面数据');
 
         var ext = type.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
+
+        // MediaRecorder 给的是分片 MP4，很多播放器拖不动进度条，这里重建索引
+        var rebuilt = false;
+        if (ext === 'mp4' && window.OfflineExport && window.OfflineExport.rebuildMp4) {
+          setStatus('重建 MP4 索引…');
+          try {
+            var fixed = await window.OfflineExport.rebuildMp4(blob);
+            if (fixed && fixed.size) { blob = fixed; rebuilt = true; }
+          } catch (err) {
+            console.warn('重建 MP4 索引失败，保留原始文件', err);
+          }
+        }
         var realDur = Math.max(0.1, recordedMs / 1000);
         var base = (state.file && state.file.name ? state.file.name : 'video').replace(/\.[^.]+$/, '');
         var name = base + '_' + (Math.round(speed * 100) / 100) + 'x_' + Math.round(realDur) + 's.' + ext;
 
         var targetDur = len / speed;
-        var text = ext.toUpperCase() + ' · ' + (blob.size / 1048576).toFixed(1) +
+        var pathText = offlineFallbackReason
+          ? '（实时录制，离线编码不可用：' + offlineFallbackReason + '）'
+          : '（实时录制）';
+        var text = ext.toUpperCase() + pathText + ' · ' + (blob.size / 1048576).toFixed(1) +
           ' MB · 实际输出 ' + fmtTenth(realDur) + '（目标 ' + fmtTenth(targetDur) + '）';
+        if (rebuilt) text += ' · 已重建索引';
         if (realDur - targetDur > Math.max(0.6, targetDur * 0.08)) {
           text += ' · 本机编码跟不上，建议改用 WebM 或降低分辨率';
         }
